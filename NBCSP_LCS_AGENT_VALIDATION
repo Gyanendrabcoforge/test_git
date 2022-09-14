@@ -1,0 +1,3073 @@
+PACKAGE BODY         NBCSP_LCS_AGENT_VALIDATION AS
+
+/*
+
+***************************************************************************************************************************
+
+*  #     #
+
+*  #     #  ######  #####    ####      #     ####   #    #
+
+*  #     #  #       #    #  #          #    #    #  ##   #
+
+*  #     #  #####   #    #   ####      #    #    #  # #  #
+
+*   #   #   #       #####        #     #    #    #  #  # #
+
+*    # #    #       #   #   #    #     #    #    #  #   ##
+
+*     #     ######  #    #   ####      #     ####   #    #
+
+------------------------------------------------------------------------------
+
+   Current version of package body.
+
+   This should be updated every time the package body is changed and checked in.
+
+   If methods are added or removed or signatures are changed, increment the
+
+   major rev.  Otherwise increment the minor rev.
+
+   Use this version number in the maintenance logs at the top of each method.
+
+***************************************************************************************************************************
+
+*/
+
+VERSION_BODY      CONSTANT VARCHAR2(5) := '3.1';
+
+/*
+
+***************************************************************************************************************************
+
+Package Body
+
+***************************************************************************************************************************
+
+Package Name:     dpssadm.nbcsp_lcs_agent_validation
+
+Description:
+
+  This package contains function and procedures used to generage the xml required by the LCS agent validation
+
+  web service.  The xml will be sent as a SOAP message via a HTTP POST.
+
+***************************************************************************************************************************
+
+  Maintenance Log:
+
+      Pkg
+
+Iss#  Ver   When           Who      What
+
+------------------------------------------------------------------------------
+
+         1.0   12-13-2006     JNN   Initial Revision.
+
+------------------------------------------------------------------------------
+
+P14831   1.1   11-15-2007     JNN   Modifications for move to Solaris DB.
+
+------------------------------------------------------------------------------
+
+P14799   1.2   11-11-2008     JNN   Modifications for Life Reserve product.
+
+------------------------------------------------------------------------------
+
+P17477   1.3   01-22-2009     JNN   Modifications for Preservation Edge product.
+
+------------------------------------------------------------------------------
+
+P18230   2.0   08-31-2010     JNN   Correctly convert coverage code.
+
+------------------------------------------------------------------------------
+
+P18230   2.1   08-31-2010     JNN   Modifications for LCS XML Gateway changes.
+
+------------------------------------------------------------------------------
+
+P23378   2.2   01-31-2012     JNN   Modifications for MG Compensation changes.
+
+                                    Correctly translate plan codes for MG.
+
+------------------------------------------------------------------------------
+
+P23233   2.3   01-04-2013     JNN   Modifications for IMPACT upgrade.
+
+                                    Added logic to set Wallet for HTTPS (SSL).
+
+------------------------------------------------------------------------------
+
+P32392   2.4   03-19-2018     JNN   Added exception handling for an invalid/missing signature date.
+
+------------------------------------------------------------------------------
+
+P32472   2.5   09-06-2018     JNN   Pass LTC Rider code for Product Code if LTC Rider exists on policy.
+
+------------------------------------------------------------------------------
+
+P32476   3.0   01-07-2019     JNN   Modifications for MoneyGuard III product.
+
+                                    Added logic to properly translate LW plan codes to Fusion plan codes.
+
+------------------------------------------------------------------------------
+
+P33732   3.1   10-12-2020     JNN   Modifications for MG Market Advantage (MGMA)
+
+***************************************************************************************************************************
+
+*/
+
+/*
+
+***************************************************************************************************************************
+
+* Package Internal Constants
+
+***************************************************************************************************************************
+
+*/
+
+   -- LF character for formatting error strings
+
+   LF                        CONSTANT CHAR := CHR(10);
+
+   CR                        CONSTANT CHAR := CHR(13);
+
+   c_DATE_FORMAT             CONSTANT VARCHAR2(10) := 'YYYY-MM-DD';
+
+   c_TIME_FORMAT             CONSTANT VARCHAR2(15) := 'HH24:MI:SS';
+
+   c_BEGIN_TAG               CONSTANT NUMBER := 1;
+
+   c_CLOSE_TAG               CONSTANT NUMBER := 2;
+
+--
+
+   c_CARRIER_CODE            CONSTANT VARCHAR2(5) := 'JPF';
+
+   c_CARRIER_APPT_TYPE_CODE  CONSTANT VARCHAR2(10) := '2147483647';
+
+   c_ERROR_TYPE              CONSTANT VARCHAR2(10) := 'AGENTVALID';
+
+--   c_IB_AGT_VALID_ERROR      CONSTANT VARCHAR2(6) := 'AVERR';
+
+--   c_IB_AGT_VALID_SUCCESS    CONSTANT VARCHAR2(6) := 'AVSUCC';
+
+--   c_AGENT_VALIDATION_ID     CONSTANT VARCHAR2(20) := 'AGENTVALID';
+
+/*
+
+***************************************************************************************************************************
+
+* Package Internal Variables
+
+***************************************************************************************************************************
+
+*/
+
+   CURSOR c_policy_info(p_company IN VARCHAR2, p_policy IN VARCHAR2) IS
+      SELECT s.sum_companycode AS company,s.sum_polnum AS policy,TRUNC(s.sum_received_date) AS received_date,
+             TO_CHAR(s.sum_effdate, c_DATE_FORMAT) AS eff_date,s.sum_app_state AS app_state,
+             NVL(sjp.uw_type,'FUW') AS uw_type,DECODE(NVL(sjp.emp_discount_pgm_ind,'N'),'N','N','Y') AS emp_discount_pgm_ind,
+             NVL(sjp.mg_int_exchg_pgm_ind,'N') AS mg_int_exchg_pgm_ind,NVL(sjp.mg_special_plan_ind,'N') as mg_special_plan_ind,
+             c.plan_code AS plan_code,c.cov_code AS cov_code,pd.generic_plan_code AS generic_plan_code,
+             NVL(b.premium_mode,'UNK') AS premium_mode,pwa.l1_ffn_flex_cde AS agent_code,
+             pwa.l1_ffn_flx_typ_cde AS agent_type,pwa.cmsn_sit_nbr AS agent_sit_nbr,
+             pwa.cmsn_phs_nbr AS agent_phs_nbr,pwa.cmsn_sub_phs_nbr AS agent_sub_phs_nbr
+        FROM winrisk.summary s,             winrisk.summary_jp sjp,
+             winrisk.coverages c,             winrisk.plans_desc pd,
+             winrisk.billing b,             dpssadm.nbcsk_pol_wrtg_agt pwa
+       WHERE s.sum_companycode = p_company         AND s.sum_polnum = p_policy
+         AND s.sum_companycode = sjp.company_code         AND s.sum_polnum = sjp.policy_no
+         AND s.sum_polnum = c.policy_no         AND c.plan_code = pd.plan_code (+)
+         AND s.sum_polnum = b.policy_no (+)         AND s.sum_companycode = pwa.co_cde
+         AND s.sum_polnum = pwa.sum_pol_nbr;
+
+--
+
+   CURSOR c_ltc_rider(p_company IN VARCHAR2, p_policy IN VARCHAR2) IS
+
+      SELECT R.policy_no, R.insured_id, R.rider_code, R.amount
+        FROM winrisk.riders R,
+             winrisk.riders_desc RD
+       WHERE R.policy_no = p_policy
+         AND R.company_code = p_company
+         AND R.rider_code = RD.rider_code
+         AND RD.rider_group = 'LTCR'
+       ORDER BY R.insured_id;
+
+--
+
+   g_routine_name                VARCHAR2(64) := NULL;
+
+   g_debug_mode                  BOOLEAN := TRUE;
+
+--
+
+   r_policy_info                 c_policy_info%ROWTYPE;
+
+   r_ltc_rider                   c_ltc_rider%ROWTYPE;
+
+   TYPE t_lcs_results IS TABLE OF VARCHAR2(255);
+
+/*
+
+***************************************************************************************************************************
+
+*  ######
+
+*  #     #    ##     ####   #    #    ##     ####   ######
+
+*  #     #   #  #   #    #  #   #    #  #   #    #  #
+
+*  ######   #    #  #       ####    #    #  #       #####
+
+*  #        ######  #       #  #    ######  #  ###  #
+
+*  #        #    #  #    #  #   #   #    #  #    #  #
+
+*  #        #    #   ####   #    #  #    #   ####   ######
+
+*
+
+*   #####
+
+*  #     #   ####   #####   ######
+
+*  #        #    #  #    #  #
+
+*  #        #    #  #    #  #####
+
+*  #        #    #  #    #  #
+
+*  #     #  #    #  #    #  #
+
+*   #####    ####   #####   ######
+
+***************************************************************************************************************************
+
+*/
+
+/*
+
+***************************************************************************************************************************
+
+* FUNCTION:  GetPkgVersion
+
+*
+
+* Description:  Returns a string with version information for the package header and body.
+
+***************************************************************************************************************************
+
+*/
+
+FUNCTION GetPkgVersion
+
+   RETURN VARCHAR2
+
+   IS
+
+   BEGIN
+
+      RETURN 'Header: '||VERSION_HEADER||' / Body: '||VERSION_BODY;
+
+   END GetPkgVersion;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: GetOracleInstance
+
+*
+
+* Description:  This function returns a string containing the oracle instance in which the package is running.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION GetOracleInstance(a_replace IN CHAR := 'Y')
+
+   RETURN VARCHAR2
+
+   IS
+
+      l_global_name           VARCHAR2(30);
+      l_oracle_instance       VARCHAR2(25);
+
+   BEGIN
+
+      l_global_name := DPSSADM.NBCSP_WR_UTILITY_PKG.GetGlobalName;
+
+      IF a_replace = 'Y' THEN
+
+         l_oracle_instance := 'Oracle' || DPSSADM.NBCSP_WR_UTILITY_PKG.GetDatabaseXName(l_global_name);
+
+      ELSE
+
+         l_oracle_instance := DPSSADM.NBCSP_WR_UTILITY_PKG.GetDatabaseUsageName(l_global_name);
+
+      END IF;
+
+      RETURN l_oracle_instance;
+
+--Build_XML
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         RAISE;
+
+   END GetOracleInstance;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Get_State_Code
+
+*
+
+* Description:  This function looksup the state numeric code (ACORD) using the passed state abbreviation.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Get_State_Code( p_state IN VARCHAR2 )
+
+   RETURN VARCHAR2
+
+   IS
+
+      c_ROUTINE_NAME          CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.get_state_code) ';
+
+      l_state_code            winrisk.state.acord_state_code%TYPE;
+
+   BEGIN
+
+      SELECT TRIM(acord_state_code)
+
+        INTO l_state_code
+
+        FROM winrisk.state
+
+       WHERE state_abbr = p_state;
+
+--
+
+      RETURN l_state_code;
+
+--
+
+   EXCEPTION
+
+      WHEN NO_DATA_FOUND THEN
+
+         RETURN NULL;
+
+--
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+   END Get_State_Code;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Get_Residence_State
+
+*
+
+* Description:  This function reads either the WINRISK.NAME table to obtain the residence state of the primary insured
+
+*               or the WINRISK.OWNER table to obtain the residence state of the owner.  A parameter is passed into the
+
+*               function to determine which table to query.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Get_Residence_State( p_company IN VARCHAR2,
+
+                              p_policy  IN VARCHAR2,
+
+                              p_type    IN VARCHAR2 )
+
+   RETURN VARCHAR2
+
+   IS
+
+      c_ROUTINE_NAME           CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.get_residence_state) ';
+
+--
+
+      CURSOR c_owners(a_company IN VARCHAR2, a_policy IN VARCHAR2) IS
+
+        SELECT owner_seqnum AS seqnbr,
+
+               owner_state AS state
+
+          FROM winrisk.owner
+
+         WHERE company_code = a_company
+
+           AND owner_polnum = a_policy
+
+         ORDER BY owner_seqnum ASC;
+
+
+
+      r_owners                c_owners%ROWTYPE;
+
+      l_state_abbr            VARCHAR2(30);
+
+      l_state_code            VARCHAR2(25);
+
+--
+
+   BEGIN
+
+      -- Obtain state for primary insured
+
+      IF p_type = 'I' THEN
+
+         SELECT TRIM(name_state)
+
+           INTO l_state_abbr
+
+           FROM winrisk.name
+
+          WHERE name_companycode = p_company
+
+            AND name_polnum = p_policy
+
+            AND name_role = 'I'
+
+            AND rownum <= 1;
+
+      ELSIF p_type = 'O' THEN
+
+         OPEN c_owners (p_company, p_policy);
+
+         -- only need to process the first owner returned in cursor
+
+         FETCH c_owners INTO r_owners;
+
+         IF c_owners%FOUND THEN
+
+            l_state_abbr := r_owners.state;
+
+         ELSE
+
+            l_state_abbr := NULL;
+
+         END IF;
+
+--
+
+         IF c_owners%ISOPEN THEN
+
+            CLOSE c_owners;
+
+         END IF;
+
+      ELSE
+
+         RAISE e_INVALID_PARAM_RESIDENCE_ST;
+
+      END IF;
+
+--
+
+      l_state_code := Get_State_Code(l_state_abbr);
+
+--
+
+      RETURN l_state_code;
+
+--
+
+   EXCEPTION
+
+      WHEN NO_DATA_FOUND THEN
+
+         RETURN NULL;
+
+--
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         IF c_owners%ISOPEN THEN
+
+           CLOSE c_owners;
+
+         END IF;
+
+         RAISE;
+
+   END Get_Residence_State;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Get_App_Signature_Date
+
+*
+
+* Description: This function reads the WINRISK.NAME table to determine the application signature date.
+
+*              It uses the earliest date if more than 1 insured exists on the policy.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Get_App_Signature_Date( p_company IN VARCHAR2,
+
+                                 p_policy  IN VARCHAR2 )
+
+   RETURN VARCHAR2
+
+   IS
+
+      c_ROUTINE_NAME          CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.get_app_signature_date) ';
+
+      l_app_signed_date       DATE;
+
+   BEGIN
+
+      SELECT MIN(name_sig_date)
+
+        INTO l_app_signed_date
+
+        FROM winrisk.name
+
+       WHERE name_companycode = p_company
+
+         AND name_polnum = p_policy;
+
+--
+
+      IF l_app_signed_date IS NULL THEN
+
+         RAISE e_INVALID_SIGNATURE_DATE;
+
+      END IF;
+
+--
+
+      RETURN l_app_signed_date;
+
+--
+
+   EXCEPTION
+
+      WHEN NO_DATA_FOUND THEN
+
+         RETURN NULL;
+
+--
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+   END Get_App_Signature_Date;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Get_Signature_City
+
+*
+
+* Description:  This function reads the WINRISK.NAME table to obtain the signature city (if signature state is 'FL')
+
+*               of the primary insured.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Get_Signature_City( p_company IN VARCHAR2,
+
+                             p_policy  IN VARCHAR2 )
+
+   RETURN VARCHAR2
+
+   IS
+
+      c_ROUTINE_NAME           CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.get_signature_city) ';
+
+--
+
+      l_signature_state        winrisk.name.signature_state%TYPE;
+
+      l_signature_city         winrisk.name.signature_city%TYPE;
+
+--
+
+   BEGIN
+
+      SELECT TRIM(signature_state), TRIM(signature_city)
+
+        INTO l_signature_state, l_signature_city
+
+        FROM winrisk.name
+
+       WHERE name_companycode = p_company
+
+         AND name_polnum = p_policy
+
+         AND name_role = 'I'
+
+         AND rownum <= 1;
+
+--
+
+      IF l_signature_state <> 'FL' THEN
+
+         l_signature_city := NULL;
+
+      END IF;
+
+      RETURN l_signature_city;
+
+--
+
+   EXCEPTION
+
+      WHEN NO_DATA_FOUND THEN
+
+         RETURN NULL;
+
+--
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+   END Get_Signature_City;
+
+/*
+
+*************************************************************************************************************************
+
+* Procedure: Update_PWA
+
+*
+
+* Description:  Updates the DPSSADM.NBCSK_POL_WRTG_AGT table
+
+**************************************************************************************************************************
+
+*/
+
+PROCEDURE Update_PWA(r_policy_info  IN c_policy_info%rowtype,
+
+                     p_agent_code   IN VARCHAR2,
+
+                     p_profile_code IN VARCHAR2)
+
+   IS
+
+      c_ROUTINE_NAME             CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.update_pwa) ';
+
+--
+
+   BEGIN
+
+      UPDATE dpssadm.nbcsk_pol_wrtg_agt
+
+         SET lcs_agent_code = p_agent_code,
+
+             lcs_profile_code = p_profile_code
+
+       WHERE co_cde = r_policy_info.company
+
+         AND sum_pol_nbr = r_policy_info.policy
+
+         AND cmsn_phs_nbr = r_policy_info.agent_phs_nbr
+
+         AND cmsn_sub_phs_nbr = r_policy_info.agent_sub_phs_nbr;
+
+--
+
+      COMMIT;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         ROLLBACK;
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+   END Update_PWA;
+
+/*
+
+*************************************************************************************************************************
+
+* Procedure: Insert_Inbox_Record
+
+*
+
+* Description:  Inserts a record into the WINRISK.INBOX table using the passed inbox service code.
+
+**************************************************************************************************************************
+
+*/
+
+/*PROCEDURE Insert_Inbox_Record(p_company    IN VARCHAR2,
+
+                              p_policy     IN VARCHAR2,
+
+                              p_inbox_code IN VARCHAR2,
+
+                              p_userid     IN VARCHAR2)
+
+   IS
+
+      c_ROUTINE_NAME             CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.insert_inbox_record) ';
+
+--
+
+   BEGIN
+
+      INSERT INTO winrisk.inbox
+
+         ( ib_from,
+
+           ib_service_code,
+
+           ib_policy_num,
+
+           ib_viewed,
+
+           ib_underid,
+
+           ib_date,
+
+           company_code,
+
+           record_key
+
+         ) VALUES (
+
+           c_AGENT_VALIDATION_ID,
+
+           p_inbox_code,
+
+           p_policy,
+
+           0,
+
+           p_userid,
+
+           SYSDATE,
+
+           p_company,
+
+           SYS_GUID
+
+         );
+
+--
+
+      COMMIT;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         ROLLBACK;
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+   END Insert_Inbox_Record;*/
+
+--
+
+/*
+
+*************************************************************************************************************************
+
+* Procedure: Insert_Agent_Validation_Errors
+
+*
+
+* Description:  Inserts a record into the DPSSADM.NBCSK_PRODUCT_EDIT_ERROR_LOG table using the passed info.
+
+**************************************************************************************************************************
+
+*/
+
+PROCEDURE Insert_Agent_Validation_Errors(p_company     IN VARCHAR2,
+
+                                         p_policy      IN VARCHAR2,
+
+                                         p_error_code  IN VARCHAR2,
+
+                                         p_error_desc  IN VARCHAR2,
+
+                                         p_userid      IN VARCHAR2)
+
+   IS
+
+      c_ROUTINE_NAME             CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.insert_agent_validation_errors) ';
+
+      l_error_restriction        dpssadm.nbcsk_lcs_error_codes.restriction%TYPE;
+
+      l_error_desc               dpssadm.nbcsk_product_edit_error_log.error_desc%TYPE;
+
+      l_canned_msg               VARCHAR2(100);
+
+
+
+--
+
+   BEGIN
+
+      l_canned_msg := '  Agent error-verify agent code/sit, create issue log if needed.';
+
+--
+
+      -- Determine if error is rejectable or informational.  Only insert rejectable errors into the error log table.
+
+      BEGIN
+
+         SELECT restriction
+
+           INTO l_error_restriction
+
+           FROM dpssadm.nbcsk_lcs_error_codes
+
+          WHERE error_code = p_error_code;
+
+      EXCEPTION
+
+         WHEN OTHERS THEN
+
+            l_error_restriction := 'R';
+
+      END;
+
+      IF l_error_restriction = 'R' THEN
+
+--         Insert_Inbox_Record(p_company, p_policy, c_IB_AGT_VALID_ERROR, p_userid);
+
+--
+
+         l_error_desc := p_error_desc;
+
+         -- Replace any carriage returns with a space
+
+         l_error_desc := REPLACE(l_error_desc, CR, ' ');
+
+         -- Replace any line feeds with a NULL
+
+         l_error_desc := REPLACE(l_error_desc, LF, NULL);
+
+         IF p_error_code <> 'RLCS' THEN
+
+            l_error_desc := SUBSTR(l_error_desc || l_canned_msg, 1, 255);
+
+         END IF;
+
+--
+
+         INSERT INTO dpssadm.nbcsk_product_edit_error_log (
+
+            record_key,
+
+            company_code,
+
+            policy_no,
+
+            severity_level,
+
+            error_code,
+
+            error_desc,
+
+            override_error_ind,
+
+            user_id,
+
+            row_added_dt,
+
+            error_type
+
+          ) VALUES (
+
+            SYS_GUID,
+
+            p_company,
+
+            p_policy,
+
+            l_error_restriction,
+
+            p_error_code,
+
+            l_error_desc,
+
+            'N',
+
+            p_userid,
+
+            SYSDATE,
+
+            c_ERROR_TYPE);
+
+--
+
+         COMMIT;
+
+      END IF;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         ROLLBACK;
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+   END Insert_Agent_Validation_Errors;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: DSS_Agent_Info_Exists
+
+*
+
+* Description: This function reads the DPSSADM.NBCSK_WRTG_AGT_SIT table to determine if the DSS producer code and profile
+
+*              code exists for the passed agent code, agent type, and situation number.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION DSS_Agent_Info_Exists( p_agent_code    IN VARCHAR2,
+                                p_agent_type    IN VARCHAR2,
+                                p_agent_sit_nbr IN NUMBER )
+
+   RETURN BOOLEAN
+
+   IS
+
+      c_ROUTINE_NAME          CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.dss_agent_info_exists) ';
+      l_dss_producer_code     dpssadm.nbcsk_wrtg_agt_sit.dss_producer_cde%TYPE;
+      l_dss_profile_code      dpssadm.nbcsk_wrtg_agt_sit.dss_profile_cde%TYPE;
+      l_result                BOOLEAN := FALSE;
+
+   BEGIN
+
+      SELECT TRIM(dss_producer_cde),
+             TRIM(dss_profile_cde)
+        INTO l_dss_producer_code,
+             l_dss_profile_code
+        FROM dpssadm.nbcsk_wrtg_agt_sit
+       WHERE l1_ffn_flex_cde = p_agent_code
+         AND l1_ffn_flx_typ_cde = p_agent_type
+         AND cmsn_sit_nbr = p_agent_sit_nbr;
+
+--
+
+      IF l_dss_producer_code IS NULL
+
+      OR l_dss_profile_code IS NULL THEN
+
+         l_result := FALSE;
+
+      ELSE
+
+         l_result := TRUE;
+
+      END IF;
+
+      RETURN l_result;
+
+--
+
+   EXCEPTION
+
+      WHEN NO_DATA_FOUND THEN
+         RETURN FALSE;
+
+--
+
+      WHEN OTHERS THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         RAISE;
+
+   END DSS_Agent_Info_Exists;
+
+/*
+
+*************************************************************************************************************************
+
+* PROCEDURE: Display_Results
+
+*
+
+* Description: This procedure displays the passed string to the SQL Plus console in 255 byte chunks.
+
+**************************************************************************************************************************
+
+*/
+
+PROCEDURE Display_Results(env IN VARCHAR2)
+
+   IS
+
+   i pls_integer;
+
+   len pls_integer;
+
+   BEGIN
+
+      i := 1;
+
+      len := LENGTH(env);
+
+      WHILE (i <= len) LOOP
+
+         DBMS_OUTPUT.PUT_LINE(SUBSTR(env, i, 255));
+
+         i := i + 255;
+
+      END LOOP;
+
+   END Display_Results;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Generate_SOAP_Envelope
+
+*
+
+* Description: This function wraps the SOAP envelope necessary to call the LCS web service around the passed xml.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Generate_SOAP_Envelope( p_xml IN CLOB )
+
+   RETURN CLOB
+
+   IS
+
+      c_ROUTINE_NAME             CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.generate_soap_envelope) ';
+      l_env                      CLOB;
+
+   BEGIN
+
+--
+
+      l_env := '<?xml version=""1.0"" encoding=""UTF-8"" ?>
+                <soapenv:Envelope xmlns:xsd=""http://www.w3.org/2001/XMLSchema"" xmlns:soapenv=""http://schemas.xmlsoap.org/soap/envelope/"" xmlns:xsi=""http://www.w3.org/2001/XMLSchema-instance"">
+                <soapenv:Body>';
+      l_env := l_env || p_xml || '</soapenv:Body></soapenv:Envelope>';
+
+--
+
+      RETURN l_env;
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         RAISE;
+
+   END Generate_SOAP_Envelope;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Get_Web_Service_URL
+
+*
+
+* This function returns a string containing the URL used to send the xml request to the LCS Agent Validation web service.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Get_Web_Service_URL
+
+   RETURN VARCHAR2
+
+   IS
+
+      l_url                   VARCHAR2(200);
+
+   BEGIN
+
+      -- Execute query to obtain the LCS Agent Validation URL.
+
+      SELECT TRIM(config_settings_value)  INTO l_url
+        FROM dpssadm.nbcsk_spoe_config_settings
+       WHERE UPPER(config_settings_key) = 'LCS_AGENT_VALIDATION_URL';
+
+--
+
+      RETURN l_url;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+         RETURN NULL;
+
+--
+
+   END Get_Web_Service_URL;
+
+
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Get_SSL_Wallet_Path
+
+*
+
+* This function returns a string containing the path for the Oracle SSL (HTTPS) Wallet.
+
+*************************************************************************************************************************
+
+*/
+
+FUNCTION Get_SSL_Wallet_Path
+
+   RETURN VARCHAR2
+
+   IS
+
+      l_ssl_wallet_path                  VARCHAR2(200);
+
+   BEGIN
+
+      -- Execute query to obtain the Oracle SSL Wallet Path.
+
+      SELECT TRIM(config_settings_value)
+
+        INTO l_ssl_wallet_path
+
+        FROM dpssadm.nbcsk_spoe_config_settings
+
+       WHERE UPPER(config_settings_key) = 'ORACLE_SSL_WALLET_PATH';
+
+--
+
+      RETURN l_ssl_wallet_path;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         RETURN NULL;
+
+--
+
+   END Get_SSL_Wallet_Path;
+
+/*
+
+
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Get_SSL_Wallet_Code
+
+*
+
+* This function returns a string containing the SSL code for the Oracle SSL (HTTPS) Wallet.
+
+*************************************************************************************************************************
+
+*/
+
+FUNCTION Get_SSL_Wallet_Code
+
+   RETURN VARCHAR2
+
+   IS
+
+      l_ssl_wallet_code                  VARCHAR2(30);
+
+   BEGIN
+
+      -- Execute query to obtain the Oracle SSL Wallet Code.
+
+      SELECT TRIM(config_settings_value)
+
+        INTO l_ssl_wallet_code
+
+        FROM dpssadm.nbcsk_spoe_config_settings
+
+       WHERE UPPER(config_settings_key) = 'ORACLE_SSL_WALLET_CODE';
+
+--
+
+      RETURN l_ssl_wallet_code;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         RETURN NULL;
+
+--
+
+   END Get_SSL_Wallet_Code;
+
+
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Get_App_Credentials
+
+*
+
+* This function reads the winrisk.application_credentials table to obtain the property value for the passed
+
+* parameter.
+
+*************************************************************************************************************************
+
+*/
+
+FUNCTION Get_App_Credentials(p_app_name IN VARCHAR2,
+
+                             p_app_key  IN VARCHAR2)
+
+   RETURN VARCHAR2
+
+   IS
+
+      l_property_value                  VARCHAR2(200);
+
+   BEGIN
+
+      -- Execute query to obtain the property value.
+
+      SELECT TRIM(app_value)
+
+        INTO l_property_value
+
+        FROM winrisk.application_credentials
+
+       WHERE app_name = p_app_name
+
+         AND app_key = p_app_key;
+
+--
+
+      RETURN l_property_value;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         RETURN NULL;
+
+--
+
+   END Get_App_Credentials;
+
+
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Call_Web_Service
+
+*
+
+* Description: This function calls the LCS Agent Validation web service passing the xml that was generated from the date
+
+*              stored in Winrisk.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Call_Web_Service( p_xml IN CLOB )
+   RETURN CLOB
+   IS
+      c_ROUTINE_NAME            CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.call_web_service) ';
+      l_soap_env                CLOB;
+      l_url                     VARCHAR2(200);
+      l_ssl_wallet_path         VARCHAR2(200);
+      l_ssl_wallet_code         VARCHAR2(30);
+      l_auth_user               VARCHAR2(50);
+      l_auth_pswd               VARCHAR2(50);
+      l_req                     UTL_HTTP.REQ;    -- HTTP request
+      l_resp                    UTL_HTTP.RESP;   -- HTTP response
+      l_timeout                 INTEGER DEFAULT 90;
+      l_response_text           VARCHAR2(32767);
+      l_response_xml            CLOB;
+   BEGIN
+      l_url := Get_Web_Service_URL;
+      IF l_url IS NULL THEN
+         RAISE e_WEB_SERVICE_URL_UNDEFINED;
+      END IF;
+      l_soap_env := Generate_SOAP_Envelope(p_xml);
+
+      -- Request that exceptions are raised for error status codes
+
+      UTL_HTTP.SET_RESPONSE_ERROR_CHECK(TRUE);
+
+      -- allow testing for exceptions like Utl_Http.Http_Server_Error
+
+      UTL_HTTP.SET_DETAILED_EXCP_SUPPORT(TRUE);
+
+      UTL_HTTP.SET_TRANSFER_TIMEOUT(l_timeout);
+
+--
+
+      IF UPPER(SUBSTR(l_url,1,5)) = 'HTTPS' THEN
+
+         l_ssl_wallet_path := Get_SSL_Wallet_Path;
+
+         l_ssl_wallet_code := Get_SSL_Wallet_Code;
+
+         UTL_HTTP.SET_WALLET('file:'||l_ssl_wallet_path, l_ssl_wallet_code);
+
+      END IF;
+
+      -- Establish the connection
+      --l_req := UTL_HTTP.BEGIN_REQUEST(l_url, 'POST', 'HTTP/1.0');
+      l_req := UTL_HTTP.BEGIN_REQUEST(l_url, 'POST', 'HTTP/1.1');
+     -- Get required authentication for web service.
+      l_auth_user := Get_App_Credentials('XMLG_WEBSERVICE', 'USERNAME');
+      l_auth_pswd := Get_App_Credentials('XMLG_WEBSERVICE', 'PASSWORD');
+      UTL_HTTP.SET_AUTHENTICATION(l_req, l_auth_user, l_auth_pswd);
+--
+      -- The Content-Length header has to indicate the amount of data
+      -- in your XML document
+      UTL_HTTP.SET_HEADER(l_req, 'Content-Type', 'text/xml');
+      UTL_HTTP.SET_HEADER(l_req, 'Content-Length', TO_CHAR(LENGTH(l_soap_env)) );
+      UTL_HTTP.SET_HEADER(l_req, 'SOAPAction', l_url);
+--
+      -- POST the XML document
+      UTL_HTTP.WRITE_TEXT(l_req, l_soap_env);
+      -- Now process the HTTP server's response
+      l_resp := UTL_HTTP.GET_RESPONSE(l_req);
+      IF g_debug_mode THEN
+         DBMS_OUTPUT.PUT_LINE('HTTP response status code: ' || l_resp.status_code);
+         DBMS_OUTPUT.PUT_LINE('HTTP response reason phrase: ' || l_resp.reason_phrase);
+      END IF;
+      -- Obtain the response xml (text)
+      BEGIN
+         LOOP
+            UTL_HTTP.READ_TEXT(l_resp, l_response_text, 32767);
+            l_response_xml := l_response_xml || l_response_text;
+         END LOOP;
+--
+
+      EXCEPTION
+
+         WHEN UTL_HTTP.END_OF_BODY THEN
+            UTL_HTTP.END_RESPONSE(l_resp);
+
+      END;
+
+--
+
+      IF g_debug_mode THEN
+
+         Display_Results(l_response_xml);
+
+      END IF;
+
+--
+
+      RETURN l_response_xml;
+
+--
+
+   EXCEPTION
+
+      WHEN e_WEB_SERVICE_URL_UNDEFINED THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE e_WEB_SERVICE_URL_UNDEFINED;
+
+      WHEN UTL_HTTP.REQUEST_FAILED THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         UTL_HTTP.END_RESPONSE(l_resp);
+
+         RAISE e_HTTP_REQUEST_FAILED;
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         UTL_HTTP.END_RESPONSE(l_resp);
+
+         RAISE;
+
+--
+
+   END Call_Web_Service;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Parse_XML
+
+*
+
+* Description:
+
+*    This function parses the xml returned from the LCS agent validation web service.  The <ResultInfoDesc> tag will consist
+
+*    of a string delimited by a ';'.  It has the following layout:
+
+*       ERROR CODE;ERROR DESC;FLEX ID; SITUATION CODE;LCS AGENT ID;LCS AGENT PROFILE
+
+*
+
+*    The errors are inserted into the DPSSADM.NBCSK_PRODUCT_EDIT_ERROR_LOG table and the LCS Agent info is update in the
+
+*    DPSSADM.NBCSK_POL_WRTG_AGT table.
+
+*
+
+*    It returns TRUE if validation errors were returned from LCS; otherwise returns FALSE.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Parse_XML(r_policy_info      IN c_policy_info%rowtype,
+
+                   p_xml              IN CLOB,
+
+                   p_userid           IN VARCHAR2,
+
+                   p_flex_codes_match OUT BOOLEAN )
+
+   RETURN BOOLEAN
+
+   IS
+
+      c_ROUTINE_NAME                CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.parse_xml) ';
+
+--
+
+      l_doc                         XMLDOM.DOMDocument;
+
+      l_nodelist                    XMLDOM.DOMNodeList;
+
+      l_curr_node                   XMLDOM.DOMNode;
+
+--
+
+      cnt                           NUMBER := 0;
+
+      pos                           NUMBER := 0;
+
+      l_result_code                 VARCHAR2(5);
+
+      l_result_info                 VARCHAR2(4000);
+
+      l_lcs_results                 t_lcs_results := t_lcs_results();
+
+      l_flex_codes_match            BOOLEAN := TRUE;
+
+      l_agent_validation_errors     BOOLEAN := FALSE;
+
+   BEGIN
+
+      l_doc := DPSSADM.NBCSP_XML_PARSER.parse(p_xml);
+
+--
+
+      l_result_code := DPSSADM.NBCSP_XML_PARSER.valueOf(p_xml, '//TXLife/TXLifeResponse/TransResult/ResultCode/@tc');
+
+      l_nodelist := DPSSADM.NBCSP_XML_PARSER.selectNodes(l_doc, '//TXLife/TXLifeResponse/TransResult/ResultInfo');
+
+      IF XMLDOM.getLength(l_nodelist) = 0 THEN
+
+         l_lcs_results.EXTEND(2);
+
+         l_lcs_results(1) := 'RLCS';
+
+         l_lcs_results(2) := 'Null Results Returned From LCS Agent Validation';
+
+         -- Append the agent code and situation number onto the error description
+
+         l_lcs_results(2) := l_lcs_results(2) || ' (' || TRIM(r_policy_info.agent_code) || '/' || r_policy_info.agent_sit_nbr || ')';
+
+         Insert_Agent_Validation_Errors(r_policy_info.company, r_policy_info.policy, l_lcs_results(1), l_lcs_results(2), p_userid);
+
+      ELSE
+
+         --Process each <ResultInfoDesc> tag
+
+         FOR n IN 1..XMLDOM.getLength(l_nodelist) LOOP
+
+             -- Clear elments from array.
+
+             l_lcs_results.DELETE;
+
+--
+
+             l_curr_node := xmldom.item(l_nodelist, n-1);
+
+             l_result_info := DPSSADM.NBCSP_XML_PARSER.valueOf(l_curr_node,'ResultInfoDesc');
+
+--
+
+             -- Count the number of ';'
+
+             FOR idx IN 1 .. LENGTH(l_result_info) LOOP
+
+                IF SUBSTR(l_result_info, idx, 1) = ';' THEN
+
+                   cnt := cnt + 1;
+
+                END IF;
+
+             END LOOP;
+
+--
+
+             IF cnt > 0 THEN
+
+                -- Split the delimited string into an array.
+
+                WHILE LENGTH(l_result_info) > 0 LOOP
+
+                   pos := INSTR(l_result_info,';');
+
+                   IF pos > 0 THEN
+
+                      l_lcs_results.EXTEND;
+
+                      l_lcs_results(l_lcs_results.LAST) := SUBSTR(l_result_info, 1, pos-1);
+
+                      l_result_info := SUBSTR(l_result_info, pos+1);
+
+                   ELSE
+
+                      l_lcs_results.EXTEND;
+
+                      l_lcs_results(l_lcs_results.LAST) := l_result_info;
+
+                      l_result_info := '';
+
+                   END IF;
+
+                END LOOP;
+
+             ELSE
+
+                l_lcs_results.EXTEND(2);
+
+                l_lcs_results(1) := 'RLCS';
+
+                l_lcs_results(2) := SUBSTR(l_result_info, 1, 240);
+
+            END IF;
+
+--
+
+            -- If errors were returned, insert errors into error log.
+
+            IF l_lcs_results(1) IS NOT NULL
+
+            OR l_lcs_results(2) IS NOT NULL THEN
+
+               -- Append the agent code and situation number onto the error description
+
+               l_lcs_results(2) := l_lcs_results(2) || ' (' || TRIM(r_policy_info.agent_code) || '/' || r_policy_info.agent_sit_nbr || ')';
+
+               Insert_Agent_Validation_Errors(r_policy_info.company, r_policy_info.policy, l_lcs_results(1), l_lcs_results(2), p_userid);
+
+            END IF;
+
+         END LOOP;
+
+      END IF;
+
+--
+
+      -- If no agent validatation errors (result_code = '2'), update the lcs agent code and profile from data in array.
+
+      -- Element 5 is LCS agent code and element 6 is LCS profile code.
+
+      IF NVL(l_result_code, '5') = '2' THEN
+
+         -- Compare the FLEX code that was sent in the request to the FLEX code (ie l_lcs_results(3) that was returned
+
+         -- in the response.  If they do not match, then return FALSE in the output parameter so that the call to the
+
+         -- LCS Agent Validation web service can be performed again.
+
+         IF TRIM(r_policy_info.agent_code) = l_lcs_results(3) THEN
+
+            l_agent_validation_errors := FALSE;
+
+            Update_PWA(r_policy_info, l_lcs_results(5), l_lcs_results(6));
+
+            l_flex_codes_match := TRUE;
+
+         ELSE
+
+            l_agent_validation_errors := TRUE;
+
+            Update_PWA(r_policy_info, NULL, NULL);
+
+            l_flex_codes_match := FALSE;
+
+         END IF;
+
+      ELSE
+
+         -- If errors were returned, then blank lcs agent code and profile from pwa
+
+         l_agent_validation_errors := TRUE;
+
+         Update_PWA(r_policy_info, NULL, NULL);
+
+         l_flex_codes_match := TRUE;
+
+      END IF;
+
+--
+
+      XMLDOM.freeDocument(l_doc);
+
+--
+
+      p_flex_codes_match := l_flex_codes_match;
+
+      RETURN l_agent_validation_errors;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         XMLDOM.freeDocument(l_doc);
+
+         RAISE;
+
+   END Parse_XML;
+
+/*
+
+************************************************************************************************
+
+* FUNCTION: Translate_Cov_Code
+
+*
+
+* This procedure translates the Winrisk coverage code into the appropriate product type.
+
+************************************************************************************************
+
+*/
+
+FUNCTION Translate_Cov_Code(r_policy_info IN c_policy_info%rowtype)
+
+   RETURN CHAR
+
+   IS
+
+      c_ROUTINE_NAME    CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.translate_cov_code) ';
+
+      l_product_type    CHAR(1);
+
+   BEGIN
+
+      IF DPSSADM.NBCSP_WR_UTILITY_PKG.Is_Plan_MGMA(r_policy_info.policy) = 'Y' THEN
+
+         l_product_type := '4';    --VUL (treat MGMA as VUL)
+
+      ELSE
+
+         CASE r_policy_info.cov_code
+
+            WHEN '1' THEN l_product_type := '1';     -- Whole Life
+
+            WHEN '2' THEN l_product_type := '3';     -- UL
+
+            WHEN '3' THEN l_product_type := '1';     -- Term
+
+            WHEN '6' THEN l_product_type := '4';     -- VUL
+
+            WHEN '7' THEN l_product_type := '3';     -- ULLTC
+
+            WHEN '9' THEN l_product_type := '3';     -- IUL
+
+            ELSE l_product_type := '3';
+
+         END CASE;
+
+      END IF;
+
+--
+
+      RETURN l_product_type;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+--
+
+   END Translate_Cov_Code;
+
+/*
+
+************************************************************************************************
+
+* FUNCTION: Translate_MG_Plan_Code
+
+*
+
+* This procedure reads the DPSSADM.NBCSK_MG_LW_TO_VNTG_CONV table to translate the plan code
+
+* from LifeWriter into the appropriate Fusion Vantage plan code.
+
+************************************************************************************************
+
+*/
+
+FUNCTION Translate_MG_Plan_Code(r_policy_info IN c_policy_info%rowtype)
+
+   RETURN VARCHAR2
+
+   IS
+
+      c_ROUTINE_NAME         CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.translate_mg_plan_code) ';
+
+      l_vntg_company_code    dpssadm.nbcsk_upp_wr_vntg_conv.vntg_company_code%TYPE := NULL;
+
+      l_vntg_plancode        dpssadm.nbcsk_upp_wr_vntg_conv.vntg_plan_code%TYPE := NULL;
+
+      l_received_date        DATE;
+
+   BEGIN
+
+      IF r_policy_info.plan_code IN ('MGRSV','MGRSVNY','MGR09','MGR09NY') THEN
+
+         l_received_date := NVL(r_policy_info.received_date,TRUNC(SYSDATE));
+
+         IF l_received_date >= TO_DATE('03/10/2012','MM/DD/YYYY') THEN
+
+            IF r_policy_info.plan_code IN ('MGRSV','MGRSVNY') THEN
+
+               IF r_policy_info.premium_mode IN ('LBP','RSP') THEN
+
+                  l_vntg_plancode := 'MRSP12';
+
+               ELSE
+
+                  l_vntg_plancode := 'MRFL12';
+
+               END IF;
+
+            ELSIF r_policy_info.plan_code IN ('MGR09','MGR09NY') THEN
+
+               IF r_policy_info.premium_mode IN ('LBP','RSP') THEN
+
+                  l_vntg_plancode := 'MPSP12';
+
+               ELSE
+
+                  l_vntg_plancode := 'MPFL12';
+
+               END IF;
+
+            END IF;
+
+         ELSE
+
+            IF r_policy_info.plan_code IN ('MGRSV','MGRSVNY') THEN
+
+               IF r_policy_info.premium_mode IN ('LBP','RSP') THEN
+
+                  l_vntg_plancode := 'MGSP05';
+
+               ELSE
+
+                  l_vntg_plancode := 'MGFL05';
+
+               END IF;
+
+            ELSIF r_policy_info.plan_code IN ('MGR09','MGR09NY') THEN
+
+               IF r_policy_info.premium_mode IN ('LBP','RSP') THEN
+
+                  l_vntg_plancode := 'MGSP09';
+
+               ELSE
+
+                  l_vntg_plancode := 'MGFL09';
+
+               END IF;
+
+            END IF;
+
+         END IF;
+
+      ELSE
+
+         BEGIN
+
+            DPSSADM.NBCSP_WR_UTILITY_PKG.Obtain_MG_Vantage_Codes(r_policy_info.company,
+
+                                                                 r_policy_info.policy,
+
+                                                                 r_policy_info.plan_code,
+
+                                                                 r_policy_info.emp_discount_pgm_ind,
+
+                                                                 r_policy_info.mg_int_exchg_pgm_ind,
+
+                                                                 r_policy_info.mg_special_plan_ind,
+
+                                                                 l_vntg_company_code,
+
+                                                                 l_vntg_plancode);
+
+            -- JNN - 12/10/2020 - Replaced query below with call to DPSSADM.NBCSP_WR_UTILITY_PKG.Obtain_MG_Vantage_Codes
+
+            -- Read nbcsk_mg_lw_to_vntg_conv table to translate LW plan code to Fusion Vantage plan code.
+
+            /*
+
+            SELECT vntg_plan_code
+
+              INTO l_vntg_plancode
+
+              FROM dpssadm.nbcsk_mg_lw_to_vntg_conv
+
+              WHERE lw_company_code = r_policy_info.company
+
+               AND lw_plan_code = r_policy_info.plan_code
+
+               AND emp_discount_pgm_ind IN (r_policy_info.emp_discount_pgm_ind, 'ANY')
+
+               AND mg_int_exchg_pgm_ind IN (r_policy_info.mg_int_exchg_pgm_ind, 'ANY');
+
+            */
+
+--
+
+         EXCEPTION
+
+            WHEN OTHERS THEN
+
+               l_vntg_plancode := NULL;
+
+         END;
+
+      END IF;
+
+--
+
+      RETURN l_vntg_plancode;
+
+--
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+--
+
+   END Translate_MG_Plan_Code;
+
+/*
+
+************************************************************************************************
+
+* FUNCTION: Translate_Plan_Code
+
+*
+
+* This procedure reads the DPSSADM.NBCSK_UPP_WR_VNTG_CONV table to translate the plan code
+
+* from LifeWriter into the appropriate Fusion Vantage plan code.
+
+************************************************************************************************
+
+*/
+
+FUNCTION Translate_Plan_Code(r_policy_info IN c_policy_info%rowtype)
+
+   RETURN VARCHAR2
+
+   IS
+
+      c_ROUTINE_NAME    CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.translate_plan_code) ';
+
+      l_uw_type         dpssadm.nbcsk_upp_wr_vntg_conv.uw_type%TYPE;
+
+      l_vntg_plancode   dpssadm.nbcsk_upp_wr_vntg_conv.vntg_plan_code%TYPE := NULL;
+
+   BEGIN
+
+      IF r_policy_info.uw_type IN ('NUW','MUW') THEN
+
+         l_uw_type := 'FUW';
+
+      ELSE
+
+         l_uw_type := r_policy_info.uw_type;
+
+      END IF;
+
+--
+
+      BEGIN
+
+         -- Look for specific state first.
+
+         SELECT vntg_plan_code
+
+           INTO l_vntg_plancode
+
+           FROM dpssadm.nbcsk_upp_wr_vntg_conv
+
+           WHERE wr_company_code = r_policy_info.company
+
+            AND wr_plan_code = r_policy_info.plan_code
+
+            AND uw_type IN (l_uw_type, 'ANY')
+
+            AND state = r_policy_info.app_state;
+
+--
+
+      EXCEPTION
+
+         -- If specific state is not found, then look for 'ANY' state.
+
+         WHEN OTHERS THEN
+
+            BEGIN
+
+               SELECT vntg_plan_code
+
+                 INTO l_vntg_plancode
+
+                 FROM dpssadm.nbcsk_upp_wr_vntg_conv
+
+                WHERE wr_company_code = r_policy_info.company
+
+                  AND wr_plan_code = r_policy_info.plan_code
+
+                  AND uw_type IN (l_uw_type, 'ANY')
+
+                  AND state = 'ANY';
+
+--
+
+            EXCEPTION
+
+               WHEN OTHERS THEN
+
+                  IF r_policy_info.cov_code = '7' THEN      -- MoneyGuard
+
+                     l_vntg_plancode := Translate_MG_Plan_Code(r_policy_info);
+
+                  ELSE
+
+                     -- Use the generic plan code, which is the same as fusion vantage plan code
+
+                     l_vntg_plancode := SUBSTR(r_policy_info.generic_plan_code,1,6);
+
+                  END IF;
+
+            END;
+
+      END;
+
+--
+
+      RETURN l_vntg_plancode;
+
+--
+
+   EXCEPTION
+
+      WHEN NO_DATA_FOUND THEN
+
+         RETURN SUBSTR(r_policy_info.generic_plan_code,1,6);
+
+--
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+--
+
+   END Translate_Plan_Code;
+
+/*
+
+************************************************************************************************
+
+* FUNCTION: Translate_Rider_Code
+
+*
+
+* This procedure reads the DPSSADM.NBCSK_UPP_RIDER_BENEFIT_CONV table to translate the rider
+
+* code LifeWriter into the appropriate Vantage rider code.
+
+************************************************************************************************
+
+*/
+
+FUNCTION Translate_Rider_Code( r_policy_info  IN c_policy_info%rowtype,
+
+                               p_rider_code   IN VARCHAR2,
+
+                               p_rider_amount IN NUMBER )
+
+   RETURN VARCHAR2
+
+   IS
+
+      c_ROUTINE_NAME       CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.translate_rider_code) ';
+
+      l_age                winrisk.name.name_age%TYPE;
+
+      l_uw_type            dpssadm.nbcsk_upp_rider_benefit_conv.uw_type%TYPE;
+
+      l_rider_amount       NUMBER;
+
+      l_vntg_rider_code    dpssadm.nbcsk_upp_rider_benefit_conv.vntg_rider_benefit_code%TYPE;
+
+   BEGIN
+
+      BEGIN
+
+         -- Obtain primary insured's age
+
+         SELECT name_age
+
+           INTO l_age
+
+           FROM winrisk.name
+
+          WHERE name_companycode = r_policy_info.company
+
+            AND name_polnum = r_policy_info.policy
+
+            AND name_role = 'I'
+
+            AND rownum <= 1;
+
+      EXCEPTION
+
+         WHEN OTHERS THEN
+
+            l_age := 0;
+
+      END;
+
+--
+
+      BEGIN
+
+         IF r_policy_info.uw_type IN ('NUW','MUW') THEN
+
+            l_uw_type := 'FUW';
+
+         ELSE
+
+            l_uw_type := r_policy_info.uw_type;
+
+         END IF;
+
+         l_rider_amount := NVL(p_rider_amount,0);
+
+--
+
+         -- Search for exact match.
+
+         SELECT vntg_rider_benefit_code
+
+           INTO l_vntg_rider_code
+
+           FROM dpssadm.nbcsk_upp_rider_benefit_conv
+
+           WHERE company_code = r_policy_info.company
+
+            AND plan_code = r_policy_info.plan_code
+
+            AND rider_benefit_code = p_rider_code
+
+            AND uw_type = l_uw_type
+
+            AND state = r_policy_info.app_state
+
+            AND issue_age_low <= l_age
+
+            AND issue_age_high >= l_age
+
+            AND min_rider_amt <= l_rider_amount
+
+            AND max_rider_amt >= l_rider_amount;
+
+      EXCEPTION
+
+         -- If search from above does not match, search for exact state and 'ANY' uw_type.
+
+         WHEN OTHERS THEN
+
+            BEGIN
+
+               SELECT vntg_rider_benefit_code
+
+                 INTO l_vntg_rider_code
+
+                 FROM dpssadm.nbcsk_upp_rider_benefit_conv
+
+                WHERE company_code = r_policy_info.company
+
+                  AND plan_code = r_policy_info.plan_code
+
+                  AND rider_benefit_code = p_rider_code
+
+                  AND uw_type = 'ANY'
+
+                  AND state = r_policy_info.app_state
+
+                  AND issue_age_low <= l_age
+
+                  AND issue_age_high >= l_age
+
+                  AND min_rider_amt <= l_rider_amount
+
+                  AND max_rider_amt >= l_rider_amount;
+
+            EXCEPTION
+
+               -- If search from above does not match, search for 'ANY' state and exact uw_type.
+
+               WHEN OTHERS THEN
+
+                  BEGIN
+
+                     SELECT vntg_rider_benefit_code
+
+                       INTO l_vntg_rider_code
+
+                       FROM dpssadm.nbcsk_upp_rider_benefit_conv
+
+                      WHERE company_code = r_policy_info.company
+
+                        AND plan_code = r_policy_info.plan_code
+
+                        AND rider_benefit_code = p_rider_code
+
+                        AND uw_type = l_uw_type
+
+                        AND state = 'ANY'
+
+                        AND issue_age_low <= l_age
+
+                        AND issue_age_high >= l_age
+
+                        AND min_rider_amt <= l_rider_amount
+
+                        AND max_rider_amt >= l_rider_amount;
+
+                  EXCEPTION
+
+                     -- If search from above does not match, search for 'ANY' state and 'ANY' uw_type.
+
+                     WHEN OTHERS THEN
+
+                        BEGIN
+
+                           SELECT vntg_rider_benefit_code
+
+                             INTO l_vntg_rider_code
+
+                             FROM dpssadm.nbcsk_upp_rider_benefit_conv
+
+                            WHERE company_code = r_policy_info.company
+
+                              AND plan_code = r_policy_info.plan_code
+
+                              AND rider_benefit_code = p_rider_code
+
+                              AND uw_type = 'ANY'
+
+                              AND state = 'ANY'
+
+                              AND issue_age_low <= l_age
+
+                              AND issue_age_high >= l_age
+
+                              AND min_rider_amt <= l_rider_amount
+
+                              AND max_rider_amt >= l_rider_amount;
+
+                        EXCEPTION
+
+                           WHEN NO_DATA_FOUND THEN
+
+                              l_vntg_rider_code := NULL;
+
+                           WHEN OTHERS THEN
+
+                              RAISE;
+
+                        END;
+
+                  END;
+
+            END;
+
+      END;
+
+      RETURN l_vntg_rider_code;
+
+--
+
+   EXCEPTION
+
+      WHEN NO_DATA_FOUND THEN
+
+         RETURN NULL;
+
+      WHEN OTHERS THEN
+
+         IF g_routine_name IS NULL THEN
+
+            g_routine_name := c_ROUTINE_NAME;
+
+         END IF;
+
+         RAISE;
+
+--
+
+   END Translate_Rider_Code;
+
+/*
+
+*************************************************************************************************************************
+
+* FUNCTION: Build_XML
+
+*
+
+* Description: This function builds an XML stream containing the data from the various WinRisk tables for the specified
+
+*              policy.
+
+**************************************************************************************************************************
+
+*/
+
+FUNCTION Build_XML( r_policy_info IN c_policy_info%rowtype )
+
+   RETURN CLOB
+
+   IS
+
+      c_ROUTINE_NAME          CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.build_xml) ';
+      l_level                 NUMBER;
+      l_xml                   CLOB DEFAULT NULL;
+      l_attribute             VARCHAR2(1000);
+      l_stat_company_code     VARCHAR2(5);
+      l_plan_code             VARCHAR2(20);
+      l_ltcr_exists           BOOLEAN := FALSE;
+      l_ltcr_code             winrisk.riders.rider_code%TYPE;
+      l_ltcr_amount           winrisk.riders.amount%TYPE;
+      l_app_signed_date       DATE;
+      l_signature_city        winrisk.name.signature_city%TYPE;
+
+   BEGIN
+
+      l_level := 0;
+
+--      l_xml := '<?xml version = ' || CHR(39) || '1.0' || CHR(39) || ' encoding=' || CHR(39) || 'UTF-8' || CHR(39) || ' ?>' || LF;
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('TXLife', c_BEGIN_TAG, l_level, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('TXLifeRequest', c_BEGIN_TAG, l_level+1, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('TransRefGUID', SYS_GUID(), l_level+2, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','228', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('TransType', l_attribute, NULL, l_level+2, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','22812', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('TransSubType', l_attribute, NULL, l_level+2, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('TransExeDate', TO_CHAR(SYSDATE, c_DATE_FORMAT), l_level+2, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('TransExeTime', TO_CHAR(SYSDATE, c_TIME_FORMAT), l_level+2, FALSE);
+
+--
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('OLifE', c_BEGIN_TAG, l_level+2, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('id','Holding_1', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNodeWithAttribute('Holding', l_attribute, l_level+3, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Policy', c_BEGIN_TAG, l_level+4, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc', Translate_Cov_Code(r_policy_info), FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('ProductType', l_attribute, NULL, l_level+5, FALSE);
+
+--
+
+      -- Check to see if a LTC Rider exists on the policy, if so then the LTCR code will be used for the Product Code.
+
+      l_ltcr_exists := FALSE;
+
+      FOR r_ltc_rider IN c_ltc_rider(r_policy_info.company, r_policy_info.policy) LOOP
+
+         l_ltcr_exists := TRUE;
+
+         l_ltcr_code := r_ltc_rider.rider_code;
+
+         l_ltcr_amount := r_ltc_rider.amount;
+
+         EXIT;
+
+      END LOOP;
+
+--
+
+      IF l_ltcr_exists = TRUE THEN
+
+         l_plan_code := Translate_Rider_Code(r_policy_info, l_ltcr_code, l_ltcr_amount);
+
+      ELSE
+
+         l_plan_code := Translate_Plan_Code(r_policy_info);
+
+      END IF;
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('ProductCode', l_plan_code, l_level+5, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('CarrierCode', c_CARRIER_CODE, l_level+5, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc',Get_Residence_State(r_policy_info.company, r_policy_info.policy, 'O'), FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('Jurisdiction', l_attribute, NULL, l_level+5, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('EffDate', r_policy_info.eff_date, l_level+5, FALSE);
+
+--
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Life', c_BEGIN_TAG, l_level+5, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Coverage', c_BEGIN_TAG, l_level+6, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','1', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('IndicatorCode', l_attribute, NULL, l_level+7, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Coverage', c_CLOSE_TAG, l_level+6, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Life', c_CLOSE_TAG, l_level+5, FALSE);
+
+--
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('ApplicationInfo', c_BEGIN_TAG, l_level+5, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc', Get_State_Code(r_policy_info.app_state), FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('ApplicationJurisdiction', l_attribute, NULL, l_level+6, FALSE);
+
+      l_app_signed_date := Get_App_Signature_Date(r_policy_info.company, r_policy_info.policy);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('SignedDate', TO_CHAR(l_app_signed_date, c_DATE_FORMAT), l_level+6, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('ApplicationInfo', c_CLOSE_TAG, l_level+5, FALSE);
+
+--
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('ExtensionCode','RelationProducer 2.8.90', FALSE);
+
+      l_attribute := l_attribute || DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('VendorCode','5', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNodeWithAttribute('OLifEExtension', l_attribute, l_level+5, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('PolicyExtension', c_BEGIN_TAG, l_level+6, FALSE);
+
+--
+
+      IF SUBSTR(r_policy_info.company,1,1) = '9' THEN
+
+         l_stat_company_code := '011';
+
+      ELSE
+
+         l_stat_company_code := '400';
+
+      END IF;
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('StatutoryCompanyCode', l_stat_company_code, l_level+7, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('PolicyExtension', c_CLOSE_TAG, l_level+6, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('OLifEExtension', c_CLOSE_TAG, l_level+5, FALSE);
+
+
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Policy', c_CLOSE_TAG, l_level+4, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Holding', c_CLOSE_TAG, l_level+3, FALSE);
+
+--
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('id','Party_1', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNodeWithAttribute('Party', l_attribute, l_level+3, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Producer', c_BEGIN_TAG, l_level+4, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('id','CarrierAppointment_1', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNodeWithAttribute('CarrierAppointment', l_attribute, l_level+5, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('CompanyProducerID', TRIM(r_policy_info.agent_code), l_level+6, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc',c_CARRIER_APPT_TYPE_CODE, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('CarrierApptTypeCode', l_attribute, NULL, l_level+6, FALSE);
+
+--
+
+      l_signature_city := Get_Signature_City(r_policy_info.company, r_policy_info.policy);
+
+      IF l_signature_city IS NOT NULL THEN
+
+         l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('ApptCounty', c_BEGIN_TAG, l_level+6, FALSE);
+         l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('ApptCountyTC', l_signature_city, l_level+7, FALSE);
+         l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('ApptCounty', c_CLOSE_TAG, l_level+6, FALSE);
+
+      END IF;
+
+--
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('CarrierAppointment', c_CLOSE_TAG, l_level+5, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Producer', c_CLOSE_TAG, l_level+4, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Party', c_CLOSE_TAG, l_level+3, FALSE);
+
+--
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('id','Party_2', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNodeWithAttribute('Party', l_attribute, l_level+3, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc', Get_Residence_State(r_policy_info.company, r_policy_info.policy, 'I'), FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('ResidenceState', l_attribute, NULL, l_level+4, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Party', c_CLOSE_TAG, l_level+3, FALSE);
+
+--
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('id','Relation_1', FALSE);
+
+      l_attribute := l_attribute || DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('OriginatingObjectID','Holding_1', FALSE);
+
+      l_attribute := l_attribute || DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('RelatedObjectID','Party_1', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNodeWithAttribute('Relation', l_attribute, l_level+3, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','37', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('RelationRoleCode', l_attribute, NULL, l_level+4, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','4', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('OriginatingObjectType', l_attribute, 'Holding', l_level+4, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','6', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('RelatedObjectType', l_attribute, 'Party', l_level+4, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('ExtensionCode','RelationProducer 2.8.90', FALSE);
+
+      l_attribute := l_attribute || DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('VendorCode','5', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNodeWithAttribute('OLifEExtension', l_attribute, l_level+4, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('RelationProducerExtension', c_BEGIN_TAG, l_level+5, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNode('SituationCode', r_policy_info.agent_sit_nbr, l_level+6, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('RelationProducerExtension', c_CLOSE_TAG, l_level+5, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('OLifEExtension', c_CLOSE_TAG, l_level+4, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Relation', c_CLOSE_TAG, l_level+3, FALSE);
+
+--
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('id','Relation_2', FALSE);
+
+      l_attribute := l_attribute || DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('OriginatingObjectID','Holding_1', FALSE);
+
+      l_attribute := l_attribute || DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('RelatedObjectID','Party_2', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNodeWithAttribute('Relation', l_attribute, l_level+3, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','8', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('RelationRoleCode', l_attribute, NULL, l_level+4, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','4', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('OriginatingObjectType', l_attribute, 'Holding', l_level+4, FALSE);
+
+      l_attribute := DPSSADM.NBCSP_XML_GENERATOR.SetAttribute('tc','6', FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateChildNodeWithAttribute('RelatedObjectType', l_attribute, 'Party', l_level+4, FALSE);
+
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('Relation', c_CLOSE_TAG, l_level+3, FALSE);
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('OLifE', c_CLOSE_TAG, l_level+2, FALSE);
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('TXLifeRequest', c_CLOSE_TAG, l_level+1, FALSE);
+      l_xml := l_xml || DPSSADM.NBCSP_XML_GENERATOR.CreateParentNode('TXLife', c_CLOSE_TAG, l_level, FALSE);
+
+--
+
+      IF g_debug_mode THEN
+         DPSSADM.NBCSP_Print_CLOB(l_xml);
+      END IF;
+
+--
+
+      RETURN l_xml;
+
+   EXCEPTION
+
+      WHEN OTHERS THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         RAISE;
+
+   END Build_XML;
+
+/*
+
+*************************************************************************************************************************
+
+* PROCEDURE: Generate_XML
+
+*
+
+* Description:  This procedure calls the procedures to build the XML stream needed by the LCS Agent Validation web service.
+
+**************************************************************************************************************************
+
+*/
+
+PROCEDURE Generate_XML( p_company IN  VARCHAR2,
+                        p_policy  IN  VARCHAR2,
+                        p_msg     OUT VARCHAR2,
+                        p_userid  IN  VARCHAR2 )
+
+   IS
+
+      c_ROUTINE_NAME          CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.generate_xml) ';
+
+--
+
+      l_count                       NUMBER DEFAULT 0;
+
+      l_error_msg                   VARCHAR2(255);
+
+      l_status                      VARCHAR2(255) := 'SUCCESS';
+
+      l_request_xml                 CLOB;
+
+      l_response_xml                CLOB;
+
+      l_xml_valid                   BOOLEAN := TRUE;
+
+      l_agent_found                 BOOLEAN := FALSE;
+
+      l_agent_validation_errors     BOOLEAN := FALSE;
+
+      l_request_xml_bkp_loc         VARCHAR2(100);
+
+      l_response_xml_bkp_loc        VARCHAR2(100);
+
+      l_loop_count                  NUMBER := 1;
+
+      l_flex_codes_match            BOOLEAN := TRUE;
+
+      l_xml_bkp_file                UTL_FILE.FILE_TYPE;
+
+--
+
+   BEGIN
+
+      IF p_company IS NULL
+
+      OR p_policy IS NULL THEN
+
+         RAISE e_NULL_ARGS_PASSED;
+
+      END IF;
+
+--
+
+      IF GetOracleInstance('N') IN ('GWOP', 'CWOP') THEN
+         g_debug_mode := FALSE;
+      ELSE
+         g_debug_mode := FALSE;
+      END IF;
+
+--
+
+      BEGIN
+         SELECT value
+           INTO l_request_xml_bkp_loc
+           FROM winrisk.winrisk_config
+          WHERE section = 'AGENT_VALID'
+            AND parameter = 'REQUEST_BACKUP_LOC';
+      EXCEPTION
+         WHEN OTHERS THEN
+            l_request_xml_bkp_loc := NULL;
+      END;
+
+--
+
+      BEGIN
+         SELECT value
+           INTO l_response_xml_bkp_loc
+           FROM winrisk.winrisk_config
+          WHERE section = 'AGENT_VALID'
+            AND parameter = 'RESPONSE_BACKUP_LOC';
+      EXCEPTION
+         WHEN OTHERS THEN
+            l_response_xml_bkp_loc := NULL; 
+			END;
+
+--
+
+      -- Does policy exist on Summary table?
+
+      SELECT COUNT(*) INTO l_count
+        FROM winrisk.summary
+       WHERE sum_companycode = p_company
+         AND sum_polnum = p_policy;
+      -- If not, raise an error
+      IF l_count = 0 THEN
+         RAISE e_POLICY_NOT_FOUND;
+      END IF;
+      -- Delete any errors from the product edit error log for this company/policy/error_type.
+      DELETE FROM dpssadm.nbcsk_product_edit_error_log
+       WHERE company_code = p_company AND policy_no = p_policy
+         AND error_type = c_ERROR_TYPE;
+      l_status := 'SUCCESS';
+      l_agent_found := FALSE;
+
+      FOR r_policy_info IN c_policy_info(p_company, p_policy) LOOP
+
+         l_agent_found := TRUE;
+
+--
+
+         -- Process each agent building the xml for the call to the LCS validation web service
+
+         l_request_xml := Build_XML(r_policy_info);
+
+--
+
+         -- Backup the request xml to the specified directory.
+         IF l_request_xml_bkp_loc IS NOT NULL THEN
+            l_xml_bkp_file := UTL_FILE.FOPEN(l_request_xml_bkp_loc,  r_policy_info.policy || '-'|| TRIM(r_policy_info.agent_code) || '.xml', 'W', 32767);
+            UTL_FILE.PUT(l_xml_bkp_file, l_request_xml);
+            UTL_FILE.FCLOSE(l_xml_bkp_file);
+         END IF;
+
+--
+
+         --Validate the XML
+         l_xml_valid := DPSSADM.NBCSP_XML_GENERATOR.Is_XML_Valid(l_request_xml);
+         IF l_xml_valid = FALSE THEN
+            RAISE e_XML_INVALID;
+         END IF;
+
+--
+
+         -- Only FLEX agent codes can be validated.
+
+         IF r_policy_info.agent_type = 'FLEX' THEN
+            l_loop_count := 1;
+            WHILE l_loop_count <= 3 LOOP
+               l_response_xml := Call_Web_Service(l_request_xml);
+               l_agent_validation_errors := Parse_XML(r_policy_info, l_response_xml, p_userid, l_flex_codes_match);
+               IF l_flex_codes_match = TRUE THEN
+                  EXIT;
+               ELSE
+                   IF l_loop_count >= 3 THEN
+                      RAISE e_FLEX_MISMATCH_ERROR;
+                   END IF;
+               END IF;
+               l_loop_count := l_loop_count + 1;
+
+            END LOOP;
+
+--
+
+            -- For Momentum plans, verify that the DSS producer and profile codes are not NULL
+
+            IF SUBSTR(r_policy_info.plan_code, 4, 2) = 'MP' THEN
+               IF DSS_Agent_Info_Exists(r_policy_info.agent_code, r_policy_info.agent_type, r_policy_info.agent_sit_nbr) = FALSE THEN
+                  l_error_msg := 'DSS Producer and/or Profile Codes Cannot be Blank for Momentum Plans.' || ' (' || TRIM(r_policy_info.agent_code) || '/' || r_policy_info.agent_sit_nbr || ')';
+                  Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg , p_userid);
+                  l_agent_validation_errors := TRUE;
+               END IF;
+            END IF;
+
+--
+
+            -- Backup the response xml to the specified directory.
+
+            IF l_response_xml_bkp_loc IS NOT NULL THEN
+               l_xml_bkp_file := UTL_FILE.FOPEN(l_response_xml_bkp_loc,  r_policy_info.policy || '-'|| TRIM(r_policy_info.agent_code) || '.xml', 'W', 32767);
+               UTL_FILE.PUT(l_xml_bkp_file, l_response_xml);
+               UTL_FILE.FCLOSE(l_xml_bkp_file);
+
+            END IF;
+
+         ELSE
+
+            l_error_msg := 'Agent Type must be FLEX. Unable to Validate Agent.'
+			|| ' (' || TRIM(r_policy_info.agent_code) || '/' || r_policy_info.agent_sit_nbr || ')';
+            Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg , p_userid);
+            l_agent_validation_errors := TRUE;
+
+         END IF;
+
+--
+
+         IF l_agent_validation_errors THEN
+
+            l_status := 'ERROR';
+
+         END IF;
+
+      END LOOP;
+
+--
+
+      -- If no agents exist on the policy, generate an error.
+
+      IF l_agent_found = FALSE THEN
+
+         RAISE e_NO_AGENT_FOUND;
+
+      END IF;
+
+--
+
+      -- Set output parameter
+
+      
+
+--
+
+   EXCEPTION
+
+      WHEN e_NULL_ARGS_PASSED THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := 'Null Arguments Passed To Agent Validation.' || g_routine_name;
+         p_msg := l_error_msg;
+         RAISE_APPLICATION_ERROR( c_NULL_ARGS_PASSED, l_error_msg);
+      WHEN e_POLICY_NOT_FOUND THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := 'Company/Policy: ' || p_company || '/' || p_policy || ' Not Found.' || g_routine_name;
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg, p_userid);
+         p_msg := l_error_msg;
+      WHEN e_INVALID_PARAM_RESIDENCE_ST THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := 'Invalid Parameter Passed to Get_Residence_State method.' || g_routine_name;
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg, p_userid);
+         p_msg := l_error_msg;
+      WHEN e_NO_AGENT_FOUND THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := 'No Agent Entered. Unable to Validate Agent.';
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg , p_userid);
+         p_msg := l_error_msg;
+      WHEN e_XML_INVALID THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := 'XML Generated for Agent Validation is Invalid.';
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg, p_userid);
+         p_msg := l_error_msg;
+      WHEN e_WEB_SERVICE_URL_UNDEFINED THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := 'Agent Validation Web Service URL has not been defined in the configuration table.';
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg, p_userid);
+         p_msg := l_error_msg;
+      WHEN e_HTTP_REQUEST_FAILED THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := SUBSTR('HTTP Request Failed. ' || UTL_HTTP.GET_DETAILED_SQLERRM || g_routine_name, 1, 255);
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg, p_userid);
+         p_msg := l_error_msg;
+      WHEN e_FLEX_MISMATCH_ERROR THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := 'The Agent Validation process failed.  Please try submitting again.';
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg, p_userid);
+         p_msg := l_error_msg;
+     WHEN e_INVALID_SIGNATURE_DATE THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := 'Invalid/Missing Signature Date. Unable to Validate Agent.';
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg, p_userid);
+         p_msg := l_error_msg;
+      WHEN OTHERS THEN
+         IF g_routine_name IS NULL THEN
+            g_routine_name := c_ROUTINE_NAME;
+         END IF;
+         l_error_msg := SUBSTR(SQLERRM || g_routine_name, 1, 255);
+         Insert_Agent_Validation_Errors(p_company, p_policy, 'RLCS', l_error_msg, p_userid);
+       p_msg := l_error_msg;
+   END Generate_XML;
+--
+
+/*
+
+*************************************************************************************************************************
+
+* PROCEDURE: Generate_XML
+
+*
+
+* Description:  This procedure calls the overloaded procedure passing USER as a parameter.
+
+**************************************************************************************************************************
+
+*/
+
+PROCEDURE Generate_XML( p_company IN  VARCHAR2,
+
+                        p_policy  IN  VARCHAR2,
+
+                        p_msg     OUT VARCHAR2 )
+
+   IS
+
+      c_ROUTINE_NAME          CONSTANT VARCHAR2(64) := ' (nbcsp_lcs_agent_validation.generate_xml) ';
+
+--
+
+   BEGIN
+
+      Generate_XML( p_company, p_policy, p_msg, USER );
+
+   END Generate_XML;
+
+/*
+
+***************************************************************************************************************************
+
+*  ######
+
+*  #     #    ##     ####   #    #    ##     ####   ######
+
+*  #     #   #  #   #    #  #   #    #  #   #    #  #
+
+*  ######   #    #  #       ####    #    #  #       #####
+
+*  #        ######  #       #  #    ######  #  ###  #
+
+*  #        #    #  #    #  #   #   #    #  #    #  #
+
+*  #        #    #   ####   #    #  #    #   ####   ######
+
+*
+
+*  ###
+
+*   #     #    #     #     #####
+
+*   #     ##   #     #       #
+
+*   #     # #  #     #       #
+
+*   #     #  # #     #       #
+
+*   #     #   ##     #       #
+
+*  ###    #    #     #       #
+
+***************************************************************************************************************************
+
+*/
+
+END NBCSP_LCS_AGENT_VALIDATION;     -- Package Body
